@@ -2,6 +2,7 @@ from typing import Optional, TYPE_CHECKING
 from collections.abc import Callable
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 if TYPE_CHECKING:
     from config import Config
 
@@ -290,6 +291,12 @@ class Model(nn.Module):
             base=config.rope_theta,
         )
 
+    
+        self.gradient_checkpointing = False
+    
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
     def forward(
         self,
         input_ids,
@@ -322,17 +329,36 @@ class Model(nn.Module):
         position_embeddings = (cos, sin)
 
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                start_pos=start_pos,
-                cache_k=cache_k[i] if cache_k is not None else None,
-                cache_v=cache_v[i] if cache_v is not None else None,
-                position_embeddings=position_embeddings,
-            )
+            layer_cache_k = cache_k[i] if cache_k is not None else None
+            layer_cache_v = cache_v[i] if cache_v is not None else None
 
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+            if self.gradient_checkpointing and self.training:
+                # checkpoint takes the callable, then all positional args for it.
+                # Extra keyword args that should not be checkpointed (like cache)
+                # are passed via a lambda so the signature stays clean.
+                hidden_states = checkpoint(
+                    lambda h: layer(
+                        h,
+                        attention_mask=attention_mask,
+                        start_pos=start_pos,
+                        cache_k=layer_cache_k,
+                        cache_v=layer_cache_v,
+                        position_embeddings=position_embeddings,
+                    ),
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    start_pos=start_pos,
+                    cache_k=layer_cache_k,
+                    cache_v=layer_cache_v,
+                    position_embeddings=position_embeddings,
+                )
+                hidden_states = self.norm(hidden_states)
+                return hidden_states
     
 class CausalLM(nn.Module):
 
@@ -350,6 +376,10 @@ class CausalLM(nn.Module):
 
         # weight tying
         self.lm_head.weight = self.model.embed_tokens.weight
+
+    def enable_gradient_checkpointing(self):
+        # Delegate to the inner model where the layers actually live
+        self.model.enable_gradient_checkpointing()
 
     def forward(
         self,
