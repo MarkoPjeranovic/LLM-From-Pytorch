@@ -51,6 +51,8 @@ from datasets import Dataset as HFDataset
 from config import Config
 from model import CausalLM
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # ---------------------------------------------------------------------------
 # Tokenizer helpers

@@ -32,6 +32,8 @@ from tokenizers import Tokenizer
 from config import Config
 from model import CausalLM
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # ---------------------------------------------------------------------------
 # Sampling utilities
@@ -134,6 +136,34 @@ def sample_token(
     token_id = int(torch.multinomial(probs, num_samples=1).item())
     return token_id
 
+def debug_top_tokens(
+    logits: torch.Tensor,
+    tokenizer: Tokenizer,
+    k: int = 10,
+    prefix: str = "",
+):
+    """
+    Print top-k tokens and probabilities for debugging.
+    logits: (vocab,)
+    """
+    probs = F.softmax(logits, dim=-1)
+
+    top_probs, top_ids = torch.topk(probs, k)
+
+    print(f"\n{prefix}Top {k} tokens:")
+    for i in range(k):
+        token_id = int(top_ids[i])
+        prob = float(top_probs[i])
+
+        # Decode safely (handles weird tokens)
+        try:
+            token_str = tokenizer.decode([token_id])
+        except:
+            token_str = "<decode_error>"
+
+        token_str = token_str.replace("\n", "\\n")
+
+        print(f"{i:2d}: id={token_id:<6} prob={prob:.4f} token='{token_str}'")
 
 # ---------------------------------------------------------------------------
 # KV-cache helpers
@@ -151,6 +181,11 @@ def make_kv_cache(config: Config, batch_size: int, max_len: int, device: torch.d
         device=device, dtype=dtype,
     )
     return cache_k, cache_v
+
+def make_causal_mask(seq_len: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    mask = torch.full((seq_len, seq_len), float("-inf"), dtype=dtype, device=device)
+    mask = torch.triu(mask, diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +213,10 @@ def generate_with_cache(
     cache_k, cache_v = make_kv_cache(config, 1, total_len, device, dtype)
 
     # Prefill: process entire prompt at once
+    causal_mask = make_causal_mask(prompt_len, torch.float32, device)
     logits, _ = model(
         input_ids=input_ids,
+        attention_mask=causal_mask,
         start_pos=0,
         cache_k=cache_k,
         cache_v=cache_v,
@@ -241,9 +278,11 @@ def generate_no_cache(
     for _ in range(max_new_tokens):
         seq = torch.tensor([generated_ids], device=device, dtype=input_ids.dtype)
         seq_len = seq.shape[1]
+        causal_mask = make_causal_mask(seq_len, torch.float32, device)
 
         logits, _ = model(
             input_ids=seq,
+            attention_mask=causal_mask,
             start_pos=0,
             cache_k=None,
             cache_v=None,
