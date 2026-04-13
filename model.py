@@ -6,7 +6,6 @@ from torch.utils.checkpoint import checkpoint
 if TYPE_CHECKING:
     from config import Config
 
-
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """
@@ -62,8 +61,9 @@ def create_causal_mask(
         dtype=dtype,
         device=device,
     )
-
-    mask = torch.triu(mask, diagonal=1) # does not change shape, but zeroes out values on and under the diagonal
+    # Was: torch.triu(mask, diagonal=1)  -- WRONG for q_len != kv_len
+    # The diagonal offset must shift by (kv_len - q_len) to align causal positions
+    mask = torch.triu(mask, diagonal=kv_len - q_len + 1) # does not change shape, but zeroes out values on and under the diagonal
 
     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, q_len, kv_len)
 
@@ -333,11 +333,8 @@ class Model(nn.Module):
             layer_cache_v = cache_v[i] if cache_v is not None else None
 
             if self.gradient_checkpointing and self.training:
-                # checkpoint takes the callable, then all positional args for it.
-                # Extra keyword args that should not be checkpointed (like cache)
-                # are passed via a lambda so the signature stays clean.
                 hidden_states = checkpoint(
-                    lambda h: layer(
+                    lambda h, l=layer: l(
                         h,
                         attention_mask=attention_mask,
                         start_pos=start_pos,
@@ -347,7 +344,7 @@ class Model(nn.Module):
                     ),
                     hidden_states,
                     use_reentrant=False,
-                )
+                    )
             else:
                 hidden_states = layer(
                     hidden_states,
@@ -357,8 +354,9 @@ class Model(nn.Module):
                     cache_v=layer_cache_v,
                     position_embeddings=position_embeddings,
                 )
-                hidden_states = self.norm(hidden_states)
-                return hidden_states
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
     
 class CausalLM(nn.Module):
 
