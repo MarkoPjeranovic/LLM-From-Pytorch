@@ -51,8 +51,6 @@ from datasets import Dataset as HFDataset
 from config import Config
 from model import CausalLM
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # ---------------------------------------------------------------------------
 # Tokenizer helpers
@@ -519,13 +517,13 @@ def main():
                         help="Root directory for Arrow dataset caches")
 
     # Model
-    parser.add_argument("--hidden_size",            type=int, default=480)
-    parser.add_argument("--num_hidden_layers",      type=int, default=16)
-    parser.add_argument("--num_attention_heads",    type=int, default=8)
-    parser.add_argument("--num_key_value_heads",    type=int, default=2)
-    parser.add_argument("--intermediate_size",      type=int, default=1280)
-    parser.add_argument("--max_position_embeddings",type=int, default=2048)
-    parser.add_argument("--vocab_size",             type=int, default=16384)
+    parser.add_argument("--hidden_size",             type=int, default=480)
+    parser.add_argument("--num_hidden_layers",       type=int, default=16)
+    parser.add_argument("--num_attention_heads",     type=int, default=8)
+    parser.add_argument("--num_key_value_heads",     type=int, default=2)
+    parser.add_argument("--intermediate_size",       type=int, default=1280)
+    parser.add_argument("--max_position_embeddings", type=int, default=2048)
+    parser.add_argument("--vocab_size",              type=int, default=16384)
 
     # Training
     parser.add_argument("--seq_len",          type=int,   default=1024)
@@ -538,7 +536,7 @@ def main():
     parser.add_argument("--min_lr",           type=float, default=3e-5)
     parser.add_argument("--weight_decay",     type=float, default=0.1)
     parser.add_argument("--grad_clip",        type=float, default=1.0)
-    parser.add_argument("--use_amp",          action="store_true", default=True)
+    parser.add_argument("--use_amp",          action="store_true", default=False)
 
     # Memory optimisation
     parser.add_argument("--gradient_checkpointing", action="store_true",
@@ -612,8 +610,6 @@ def main():
     )
 
     model = CausalLM(config)
-    # Enable gradient checkpointing before moving to device so that the flag
-    # is set before DDP wraps the module. Moving to device afterwards is fine.
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
         if is_master:
@@ -627,8 +623,6 @@ def main():
         print(f"[Model] {n_params/1e6:.1f}M parameters  |  config: {config}")
 
     if ddp:
-        # find_unused_parameters=False is required with use_reentrant=False
-        # checkpointing; it also gives a small performance benefit in general.
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # ---- Optimizer --------------------------------------------------------
@@ -661,12 +655,15 @@ def main():
             print(f"[Resume] Loaded checkpoint, step={start_step}")
 
     # ---- Datasets ---------------------------------------------------------
-    # In DDP, all ranks build/load independently — they each get a different
-    # shard via dataset.shard(), so the Arrow cache must exist before non-
-    # master ranks try to load it.  We let rank 0 build it first, barrier,
-    # then all ranks load.
-    if ddp and not is_master:
-        dist.barrier()  # wait for master to build the cache
+    # Master builds the binary token cache first, then all ranks load their
+    # own shard from the guaranteed-existing cache.
+    if is_master:
+        load_or_build_bin_cache(
+            args.dataset_path, tokenizer, args.tokenizer_path, args.hf_cache_dir
+        )
+
+    if ddp:
+        dist.barrier()
 
     train_dataset = build_hf_dataset(
         args.dataset_path, tokenizer, args.tokenizer_path,
@@ -675,21 +672,23 @@ def main():
     if is_master:
         print(f"[Dataset] Training samples (this rank): {len(train_dataset)}")
 
-    if ddp and is_master:
-        dist.barrier()  # release non-master ranks
-
     # Inspect and exit early if requested
-    if args.inspect_dataloader and is_master:
-        inspect_hf_dataset(train_dataset, tokenizer, args.output_dir, n_items=100)
+    if args.inspect_dataloader:
+        if is_master:
+            inspect_hf_dataset(train_dataset, tokenizer, args.output_dir, n_items=100)
         if ddp:
+            dist.barrier()
             dist.destroy_process_group()
         return
 
     val_dataset = None
     if args.val_dataset_path is not None:
-        if ddp and not is_master:
+        if is_master:
+            load_or_build_bin_cache(
+                args.val_dataset_path, tokenizer, args.tokenizer_path, args.hf_cache_dir
+            )
+        if ddp:
             dist.barrier()
-
         val_dataset = build_hf_dataset(
             args.val_dataset_path, tokenizer, args.tokenizer_path,
             args.seq_len, rank, world_size, args.hf_cache_dir,
@@ -697,8 +696,17 @@ def main():
         if is_master:
             print(f"[Dataset] Validation samples (this rank): {len(val_dataset)}")
 
-        if ddp and is_master:
-            dist.barrier()
+    # ---- LR schedule ------------------------------------------------------
+    # Compute total optimizer steps based on whichever limit is active so that
+    # the cosine decay reaches min_lr exactly at the end of training whether
+    # that is determined by max_steps or max_epochs.
+    steps_per_epoch           = len(train_dataset) // args.batch_size
+    optimizer_steps_per_epoch = steps_per_epoch // args.grad_accum_steps
+
+    if args.max_epochs > 0:
+        total_optimizer_steps = optimizer_steps_per_epoch * args.max_epochs
+    else:
+        total_optimizer_steps = args.max_steps // args.grad_accum_steps
 
     # ---- TensorBoard ------------------------------------------------------
     writer = None
@@ -717,7 +725,7 @@ def main():
     last_ckpt_time = time.time()
 
     if is_master:
-        print(f"[Train] step={global_step}, max_steps={args.max_steps}, "
+        print(f"[Train] step={global_step}, total_optimizer_steps={total_optimizer_steps}, "
               f"effective_batch={args.batch_size * args.grad_accum_steps * world_size}")
         if args.max_epochs > 0:
             print(f"[Train] max_epochs={args.max_epochs}")
@@ -736,9 +744,10 @@ def main():
         try:
             x, y = next(data_iter)
         except StopIteration:
+            # End of epoch — run validation then decide whether to continue.
             if val_dataset is not None and is_master:
-                vl = run_validation(model, val_dataset, args.batch_size, device, args.use_amp)
-                opt_step = (global_step + 1) // args.grad_accum_steps
+                vl      = run_validation(model, val_dataset, args.batch_size, device, args.use_amp)
+                opt_step = global_step // args.grad_accum_steps
                 print(f"[Val] epoch={epoch} step={opt_step} val_loss={vl:.4f}")
                 if writer:
                     writer.add_scalar("val/loss", vl, opt_step)
@@ -750,11 +759,12 @@ def main():
                 break
 
             data_iter = fresh_iter(epoch)
-            x, y = next(data_iter)
+            x, y     = next(data_iter)
 
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
+        # Only sync gradients on the last micro-step of each accumulation window.
         sync_ctx = (
             model.no_sync()
             if ddp and (global_step + 1) % args.grad_accum_steps != 0
@@ -774,8 +784,8 @@ def main():
 
         if (global_step + 1) % args.grad_accum_steps == 0:
             opt_step = (global_step + 1) // args.grad_accum_steps
-            lr = get_lr(opt_step, args.warmup_steps,
-                        args.max_steps // args.grad_accum_steps,
+
+            lr = get_lr(opt_step, args.warmup_steps, total_optimizer_steps,
                         args.max_lr, args.min_lr)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
@@ -788,39 +798,52 @@ def main():
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
+            step_loss  = accum_loss
+            accum_loss = 0.0
+
             if is_master and opt_step % args.log_every == 0:
-                print(f"step={opt_step}  loss={accum_loss:.4f}  lr={lr:.2e}")
+                print(f"step={opt_step}  loss={step_loss:.4f}  lr={lr:.2e}")
                 if writer:
-                    writer.add_scalar("train/loss", accum_loss, opt_step)
-                    writer.add_scalar("train/lr",   lr,         opt_step)
-                accum_loss = 0.0
+                    writer.add_scalar("train/loss", step_loss, opt_step)
+                    writer.add_scalar("train/lr",   lr,        opt_step)
+
+            if is_master and args.save_every_steps > 0 and opt_step % args.save_every_steps == 0:
+                p = os.path.join(args.output_dir, f"ckpt_step{opt_step}.pt")
+                if val_dataset is not None:
+                    vl = run_validation(model, val_dataset, args.batch_size, device, args.use_amp)
+                    print(f"[Val] step={opt_step} val_loss={vl:.4f}")
+                    if writer:
+                        writer.add_scalar("val/loss", vl, opt_step)
+                save_checkpoint(model, optimizer, global_step, config, p)
+                print(f"[Ckpt] {p}")
+
+            if is_master and args.save_every_seconds > 0:
+                now = time.time()
+                if now - last_ckpt_time >= args.save_every_seconds:
+                    p = os.path.join(args.output_dir, f"ckpt_time_{int(now)}.pt")
+                    if val_dataset is not None:
+                        vl = run_validation(model, val_dataset, args.batch_size, device, args.use_amp)
+                        print(f"[Val] step={opt_step} val_loss={vl:.4f}")
+                        if writer:
+                            writer.add_scalar("val/loss", vl, opt_step)
+                    save_checkpoint(model, optimizer, global_step, config, p)
+                    print(f"[Ckpt] timed {p}")
+                    last_ckpt_time = now
 
         global_step += 1
 
-        if is_master and args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-            p = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
-            save_checkpoint(model, optimizer, global_step, config, p)
-            print(f"[Ckpt] {p}")
-
-        if is_master and args.save_every_seconds > 0:
-            now = time.time()
-            if now - last_ckpt_time >= args.save_every_seconds:
-                p = os.path.join(args.output_dir, f"ckpt_time_{int(now)}.pt")
-                save_checkpoint(model, optimizer, global_step, config, p)
-                print(f"[Ckpt] timed {p}")
-                last_ckpt_time = now
-
     # ---- Final ------------------------------------------------------------
-    if val_dataset is not None and is_master:
-        vl = run_validation(model, val_dataset, args.batch_size, device, args.use_amp)
-        print(f"[Val] final val_loss={vl:.4f}")
-        if writer:
-            writer.add_scalar("val/loss", vl, (global_step + 1) // args.grad_accum_steps)
-
     if is_master:
+        if val_dataset is not None:
+            vl = run_validation(model, val_dataset, args.batch_size, device, args.use_amp)
+            print(f"[Val] final val_loss={vl:.4f}")
+            if writer:
+                writer.add_scalar("val/loss", vl, global_step // args.grad_accum_steps)
+
         p = os.path.join(args.output_dir, "ckpt_final.pt")
         save_checkpoint(model, optimizer, global_step, config, p)
         print(f"[Done] {p}")
+
         if writer:
             writer.close()
 
