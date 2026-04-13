@@ -32,8 +32,6 @@ from tokenizers import Tokenizer
 from config import Config
 from model import CausalLM
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # ---------------------------------------------------------------------------
 # Sampling utilities
@@ -195,6 +193,7 @@ def make_causal_mask(seq_len: int, dtype: torch.dtype, device: torch.device) -> 
 @torch.no_grad()
 def generate_with_cache(
     model: CausalLM,
+    tokenizer: Tokenizer,
     input_ids: torch.Tensor,  # (1, prompt_len)
     max_new_tokens: int,
     config: Config,
@@ -213,10 +212,11 @@ def generate_with_cache(
     cache_k, cache_v = make_kv_cache(config, 1, total_len, device, dtype)
 
     # Prefill: process entire prompt at once
-    causal_mask = make_causal_mask(prompt_len, torch.float32, device)
+    dtype = next(model.parameters()).dtype
+#    causal_mask = make_causal_mask(prompt_len, dtype, device)
     logits, _ = model(
         input_ids=input_ids,
-        attention_mask=causal_mask,
+        attention_mask=None,
         start_pos=0,
         cache_k=cache_k,
         cache_v=cache_v,
@@ -227,6 +227,7 @@ def generate_with_cache(
     generated_ids = input_ids[0].tolist()
 
     for i in range(max_new_tokens):
+#        debug_top_tokens(next_logits[0], tokenizer, k=10, prefix=f"[Step {i}] ")
         token_id = sample_token(
             next_logits[0],
             temperature=temperature,
@@ -262,6 +263,7 @@ def generate_with_cache(
 @torch.no_grad()
 def generate_no_cache(
     model: CausalLM,
+    tokenizer: Tokenizer,
     input_ids: torch.Tensor,  # (1, prompt_len)
     max_new_tokens: int,
     config: Config,
@@ -278,11 +280,12 @@ def generate_no_cache(
     for _ in range(max_new_tokens):
         seq = torch.tensor([generated_ids], device=device, dtype=input_ids.dtype)
         seq_len = seq.shape[1]
-        causal_mask = make_causal_mask(seq_len, torch.float32, device)
+        dtype = next(model.parameters()).dtype
+#        causal_mask = make_causal_mask(seq_len, dtype, device)
 
         logits, _ = model(
             input_ids=seq,
-            attention_mask=causal_mask,
+            attention_mask=None,
             start_pos=0,
             cache_k=None,
             cache_v=None,
@@ -355,6 +358,7 @@ def main():
     gen_fn = generate_no_cache if args.no_kv_cache else generate_with_cache
     output_ids = gen_fn(
         model,
+        tokenizer,
         input_ids,
         max_new_tokens=args.max_new_tokens,
         config=config,
